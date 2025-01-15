@@ -1,3 +1,5 @@
-__pycache__/
-tokenizer_en.json
-tokenizer_hi.json
+__pycache__
+*.pt
+*.json
+runs/
+weights/
