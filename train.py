@@ -198,7 +198,7 @@ def train_model(config):
     writer = SummaryWriter(config['experiment_name'])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
-    scaler = GradScaler()
+    scaler = GradScaler(device='cuda')
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -249,8 +249,8 @@ def train_model(config):
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
             decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
 
-            # Run the tensors through the encoder, decoder and the projection layer
-            with autocast():
+            with autocast(device_type='cuda'):
+                # Run the tensors through the encoder, decoder and the projection layer
                 encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
                 decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
                 proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
