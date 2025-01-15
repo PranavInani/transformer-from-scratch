@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import LambdaLR
+from torch.amp import GradScaler, autocast
 
 import warnings
 from tqdm import tqdm
@@ -197,6 +198,7 @@ def train_model(config):
     writer = SummaryWriter(config['experiment_name'])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+    scaler = GradScaler()
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -248,26 +250,28 @@ def train_model(config):
             decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
 
             # Run the tensors through the encoder, decoder and the projection layer
-            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
+            with autocast():
+                encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
+                proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
 
-            # Compare the output with the label
-            label = batch['label'].to(device) # (B, seq_len)
+                # Compare the output with the label
+                label = batch['label'].to(device) # (B, seq_len)
 
-            # Compute the loss using a simple cross entropy
-            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+                # Compute the loss using a simple cross entropy
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+                batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
 
             # Log the loss
             writer.add_scalar('train loss', loss.item(), global_step)
             writer.flush()
 
             # Backpropagate the loss
-            loss.backward()
+            scaler.scale(loss).backward()
 
             # Update the weights
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
