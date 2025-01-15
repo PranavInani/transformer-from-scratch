@@ -218,9 +218,30 @@ def train_model(config):
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
         model.train()
+        
+        # Define the device
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
+        print("Using device:", device)
+        if device == 'cuda':
+            print(f"Device name: {torch.cuda.get_device_name(device.index)}")
+            print(f"Device memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024 ** 3} GB")
+            if torch.cuda.device_count() > 1:
+                print(f"Using {torch.cuda.device_count()} GPUs")
+                model = torch.nn.DataParallel(model)
+        elif device == 'mps':
+            print(f"Device name: <mps>")
+        else:
+            print("NOTE: If you have a GPU, consider using it for training.")
+            print("      On a Windows machine with NVidia GPU, check this video: https://www.youtube.com/watch?v=GMSjDTU8Zlc")
+            print("      On a Mac machine, run: pip3 install --pre torch torchvision torchaudio torchtext --index-url https://download.pytorch.org/whl/nightly/cpu")
+        device = torch.device(device)
+
+        # Move the model to the device
+        model = model.to(device)
+
+        # Training loop
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
-
             encoder_input = batch['encoder_input'].to(device) # (b, seq_len)
             decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
