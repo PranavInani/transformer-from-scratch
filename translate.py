@@ -75,5 +75,3 @@ def translate(sentence: str):
     # convert ids to tokens
     return tokenizer_tgt.decode(decoder_input[0].tolist())
     
-#read sentence from argument
-translate(1)
