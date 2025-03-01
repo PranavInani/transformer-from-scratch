@@ -5,7 +5,7 @@ def get_config():
         "batch_size": 8,
         "num_epochs": 20,
         "lr": 1e-4,
-        "seq_len": 70,
+        "seq_len": 95,
         "d_model": 512,
         "datasource": "cfilt/iitb-english-hindi",
         "lang_src": "en",
