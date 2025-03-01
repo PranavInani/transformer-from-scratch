@@ -15,12 +15,13 @@ from pathlib import Path
 # Huggingface datasets and tokenizers
 from datasets import load_dataset
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.trainers import WordLevelTrainer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
 import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
+import torch.cuda.amp as amp
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
@@ -127,10 +128,14 @@ def get_all_sentences(ds, lang):
 def get_or_build_tokenizer(config, ds, lang):
     tokenizer_path = Path(config['tokenizer_file'].format(lang))
     if not Path.exists(tokenizer_path):
-        # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
-        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+        # Replace WordLevel tokenizer with BPE tokenizer
+        tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
-        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
+        trainer = BpeTrainer(
+            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"],
+            vocab_size=config['vocab_size'],
+            min_frequency=2
+        )
         tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
     else:
@@ -173,6 +178,68 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
     model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'])
     return model
 
+class LearningRateScheduler:
+    def __init__(self, d_model, warmup_steps=4000):
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        
+    def __call__(self, step):
+        # Implement the learning rate schedule from the paper
+        step = max(1, step)  # Avoid division by zero
+        return self.d_model ** (-0.5) * min(step ** (-0.5), step * self.warmup_steps ** (-1.5))
+
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.0, path='checkpoint.pt'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.path = path
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+        
+    def __call__(self, val_loss, model, optimizer, epoch, global_step):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.save_checkpoint(model, optimizer, epoch, global_step)
+        else:
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+                
+    def save_checkpoint(self, model, optimizer, epoch, global_step):
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'global_step': global_step
+        }, self.path)
+
+def run_validation_with_loss(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer):
+    model.eval()
+    total_val_loss = 0
+    val_loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
+    
+    with torch.no_grad():
+        for batch in validation_ds:
+            encoder_input = batch["encoder_input"].to(device)
+            encoder_mask = batch["encoder_mask"].to(device)
+            decoder_input = batch['decoder_input'].to(device)
+            decoder_mask = batch['decoder_mask'].to(device)
+            label = batch['label'].to(device)
+            
+            # Calculate validation loss
+            encoder_output = model.encode(encoder_input, encoder_mask)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+            proj_output = model.project(decoder_output)
+            loss = val_loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+            total_val_loss += loss.item()
+    
+    avg_val_loss = total_val_loss / len(validation_ds)
+    writer.add_scalar('validation loss', avg_val_loss, global_step)
+    return avg_val_loss
+
 def train_model(config):
     # Define the device
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
@@ -193,10 +260,15 @@ def train_model(config):
 
     train_dataloader, val_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
+
     # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+
+    # Initialize mixed precision training
+    scaler = amp.GradScaler()
+    use_amp = config.get('use_amp', True) and torch.cuda.is_available()
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -215,27 +287,19 @@ def train_model(config):
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
+    # Initialize early stopping
+    early_stopping = EarlyStopping(
+        patience=config.get('patience', 3),
+        path=get_weights_file_path(config, 'best')
+    )
+    
+    # Initialize LR scheduler
+    scheduler = LearningRateScheduler(config['d_model'], warmup_steps=4000)
+
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
         model.train()
         
-        # Define the device
-        device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
-        print("Using device:", device)
-        if device == 'cuda':
-            print(f"Device name: {torch.cuda.get_device_name(device.index)}")
-            print(f"Device memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024 ** 3} GB")
-        elif device == 'mps':
-            print(f"Device name: <mps>")
-        else:
-            print("NOTE: If you have a GPU, consider using it for training.")
-            print("      On a Windows machine with NVidia GPU, check this video: https://www.youtube.com/watch?v=GMSjDTU8Zlc")
-            print("      On a Mac machine, run: pip3 install --pre torch torchvision torchaudio torchtext --index-url https://download.pytorch.org/whl/nightly/cpu")
-        device = torch.device(device)
-
-        # Move the model to the device
-        model = model.to(device)
-
         # Training loop
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
@@ -243,31 +307,53 @@ def train_model(config):
             decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
             decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
-
-            # Run the tensors through the encoder, decoder and the projection layer
-            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
-
-            # Compare the output with the label
             label = batch['label'].to(device) # (B, seq_len)
 
-            # Compute the loss using a simple cross entropy
-            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            # Run the tensors through the encoder, decoder and the projection layer
+            if use_amp:
+                with amp.autocast():
+                    # Forward pass
+                    encoder_output = model.encode(encoder_input, encoder_mask)
+                    decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                    proj_output = model.project(decoder_output)
+                    # Compute the loss
+                    loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Original code without mixed precision
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                proj_output = model.project(decoder_output)
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+                loss.backward()
+                optimizer.step()
 
-            # Log the loss
-            writer.add_scalar('train loss', loss.item(), global_step)
-            writer.flush()
-
-            # Backpropagate the loss
-            loss.backward()
-
-            # Update the weights
-            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # Log the loss
+            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            writer.add_scalar('train loss', loss.item(), global_step)
+            writer.flush()
+            
             global_step += 1
+
+        # Run validation with loss calculation
+        val_loss = run_validation_with_loss(model, val_dataloader, tokenizer_src, tokenizer_tgt, 
+                                           config['seq_len'], device, lambda msg: batch_iterator.write(msg),
+                                           global_step, writer)
+        
+        # Check early stopping
+        early_stopping(val_loss, model, optimizer, epoch, global_step)
+        if early_stopping.early_stop:
+            print("Early stopping triggered")
+            break
+        
+        # Log current learning rate
+        current_lr = scheduler(global_step) if scheduler else optimizer.param_groups[0]['lr']
+        writer.add_scalar('learning_rate', current_lr, global_step)
 
         # Run validation at the end of every epoch
         run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)

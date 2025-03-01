@@ -4,17 +4,19 @@ def get_config():
     return {
         "batch_size": 8,
         "num_epochs": 20,
-        "lr": 10**-4,
+        "lr": 1e-4,
         "seq_len": 70,
         "d_model": 512,
-        "datasource": 'cfilt/iitb-english-hindi',  # Updated datasource
-        "lang_src": "en",  # Updated source language
-        "lang_tgt": "hi",  # Updated target language
+        "datasource": "cfilt/iitb-english-hindi",
+        "lang_src": "en",
+        "lang_tgt": "hi",
         "model_folder": "weights",
         "model_basename": "tmodel_",
         "preload": "latest",
-        "tokenizer_file": "tokenizer_{0}.json",
-        "experiment_name": "runs/tmodel"
+        "tokenizer_file": "tokenizer_{0}_bpe.json",
+        "experiment_name": "runs/tmodel",
+        "vocab_size": 16000,
+        "use_amp": True
     }
 
 def get_weights_file_path(config, epoch: str):
